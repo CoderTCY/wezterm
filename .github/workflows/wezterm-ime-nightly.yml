@@ -1,0 +1,253 @@
+# Fork-only Windows nightly: upstream main + one pinned, independently archived patch.
+# Update PATCH_COMMIT explicitly when the patch changes; never rewrite source branches here.
+# Unchanged scheduled builds are skipped. Manual dispatch always rebuilds.
+name: WezTerm IME Nightly (Windows x64)
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/wezterm-ime-nightly.yml]
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wezterm-ime-nightly
+  cancel-in-progress: false
+
+env:
+  PATCH_COMMIT: 2c2d90a4f1e8ae1c062e7510bdc9545014da1b26
+
+jobs:
+  sources:
+    name: Select immutable sources
+    if: github.repository == 'CoderTCY/wezterm' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      upstream_sha: ${{ steps.select.outputs.upstream_sha }}
+      should_build: ${{ steps.select.outputs.should_build }}
+    steps:
+      - name: Resolve upstream and skip previously published sources
+        id: select
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          upstream_sha="$(gh api repos/wezterm/wezterm/commits/main --jq .sha)"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          source_key="Sources: upstream=${upstream_sha} patch=${PATCH_COMMIT} workflow=${WORKFLOW_SHA}"
+          notes="$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.tag_name == "ime-nightly" and .draft == false) | .body')"
+          if [[ "$EVENT_NAME" != workflow_dispatch && "$notes" == *"$source_key"* ]]; then
+            echo 'should_build=false' >> "$GITHUB_OUTPUT"
+            echo 'These exact sources and workflow are already published; skipping.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'should_build=true' >> "$GITHUB_OUTPUT"
+            echo "$source_key" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    name: Build, test and package Windows x64
+    needs: sources
+    if: needs.sources.outputs.should_build == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      BUILD_REASON: Schedule
+      CARGO_INCREMENTAL: '0'
+      RUSTUP_WINDOWS_PATH_ADD_BIN: '1'
+      SCCACHE_GHA_ENABLED: 'true'
+      RUSTC_WRAPPER: sccache
+      UPSTREAM_SHA: ${{ needs.sources.outputs.upstream_sha }}
+    steps:
+      - name: Check out the selected upstream revision
+        uses: actions/checkout@v5
+        with:
+          repository: wezterm/wezterm
+          ref: ${{ needs.sources.outputs.upstream_sha }}
+          persist-credentials: false
+
+      - name: Apply the pinned patch in the runner only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=2 "https://github.com/${GITHUB_REPOSITORY}.git" "$PATCH_COMMIT"
+          if ! git cherry-pick --no-commit "$PATCH_COMMIT"; then
+            echo '::error::The IME patch no longer applies to upstream/main. Update the patch; no release will be published.'
+            exit 1
+          fi
+          git submodule update --init --recursive --depth=1
+          echo "BUILD_TREE=$(git write-tree)" >> "$GITHUB_ENV"
+          tag_name="$(date -u +%Y%m%d-%H%M%S)-${UPSTREAM_SHA:0:8}-ime"
+          echo "TAG_NAME=$tag_name" >> "$GITHUB_ENV"
+          printf '%s\n' "$tag_name" > .tag
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Restore vendored dependencies
+        id: vendor-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor
+            .cargo/config
+          key: wezterm-ime-windows-vendor-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
+
+      - name: Vendor dependencies on cache miss
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Preserve MSVC static-CRT flags: Cargo prefers this file over config.toml.
+          cp .cargo/config.toml .cargo/config
+          cargo vendor --locked --versioned-dirs >> .cargo/config
+
+      - name: Build release binaries
+        shell: cmd
+        run: |
+          set "PATH=C:\Strawberry\perl\bin;%PATH%"
+          cargo build --release --locked -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+
+      - name: Test Windows IME offsets and caret geometry
+        shell: cmd
+        run: |
+          set "PATH=C:\Strawberry\perl\bin;%PATH%"
+          cargo test --release --locked -p window --lib ime_cursor -- --nocapture
+          if errorlevel 1 exit /b %errorlevel%
+          cargo test --release --locked -p wezterm-gui termwindow::render::screen_line::tests -- --nocapture
+
+      - name: Package installer and portable ZIP using upstream tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ci/deploy.sh
+          test -s WezTerm-nightly-setup.exe
+          test -s WezTerm-windows-nightly.zip
+          7z t WezTerm-windows-nightly.zip
+
+      - name: Verify complete portable runtime and smoke packaged binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $destination = Join-Path $env:RUNNER_TEMP 'wezterm-ime-package-smoke'
+          Expand-Archive -LiteralPath WezTerm-windows-nightly.zip -DestinationPath $destination
+          $package = Join-Path $destination "WezTerm-windows-$env:TAG_NAME"
+          $required = @(
+            'wezterm.exe', 'wezterm-gui.exe', 'wezterm-mux-server.exe',
+            'strip-ansi-escapes.exe', 'conpty.dll', 'OpenConsole.exe',
+            'libEGL.dll', 'libGLESv2.dll', 'mesa/opengl32.dll'
+          )
+          foreach ($file in $required) {
+            $path = Join-Path $package $file
+            if (!(Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -eq 0) {
+              throw "Missing packaged runtime: $file"
+            }
+          }
+          foreach ($binary in @('wezterm.exe', 'wezterm-gui.exe', 'wezterm-mux-server.exe')) {
+            $version = & (Join-Path $package $binary) --version
+            if ($LASTEXITCODE -ne 0 -or $version -notlike "*$env:TAG_NAME*") {
+              throw "Packaged $binary has an unexpected version: $version"
+            }
+            Write-Output $version
+          }
+          $stripped = "$([char]27)[31mIME smoke$([char]27)[0m" | & (Join-Path $package 'strip-ansi-escapes.exe')
+          if ($LASTEXITCODE -ne 0 -or $stripped -ne 'IME smoke') {
+            throw 'Packaged ANSI stripping smoke failed'
+          }
+
+      - name: Record source metadata and package checksums
+        shell: bash
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "upstream=wezterm/wezterm@${UPSTREAM_SHA}"
+            echo "patch=${GITHUB_REPOSITORY}@${PATCH_COMMIT}"
+            echo "build_tree=${BUILD_TREE}"
+            echo "workflow=${GITHUB_REPOSITORY}@${WORKFLOW_SHA}"
+            echo "build_version=${TAG_NAME}"
+            echo "actions_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > build-info.txt
+          sha256sum WezTerm-nightly-setup.exe > WezTerm-nightly-setup.exe.sha256
+          sha256sum WezTerm-windows-nightly.zip > WezTerm-windows-nightly.zip.sha256
+          sha256sum build-info.txt > build-info.txt.sha256
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: wezterm-ime-nightly-windows-x64
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            WezTerm-nightly-setup.exe
+            WezTerm-windows-nightly.zip
+            WezTerm-nightly-setup.exe.sha256
+            WezTerm-windows-nightly.zip.sha256
+            build-info.txt
+            build-info.txt.sha256
+
+  release:
+    name: Publish rolling IME nightly
+    needs: [sources, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified packages
+        uses: actions/download-artifact@v8
+        with:
+          name: wezterm-ime-nightly-windows-x64
+
+      - name: Publish packages and source marker
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM_SHA: ${{ needs.sources.outputs.upstream_sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          sha256sum --check WezTerm-nightly-setup.exe.sha256 WezTerm-windows-nightly.zip.sha256 build-info.txt.sha256
+          tag=ime-nightly
+          existing="$(gh api --paginate "repos/$GH_REPO/releases" --jq '.[] | select(.tag_name == "ime-nightly") | .id')"
+          if [[ -z "$existing" ]]; then
+            gh release create "$tag" --target "$PATCH_COMMIT" \
+              --title 'WezTerm IME Nightly (Windows x64)' \
+              --notes 'Verified Windows packages are being uploaded.' --draft --prerelease
+          fi
+          gh release upload "$tag" --clobber \
+            WezTerm-nightly-setup.exe WezTerm-windows-nightly.zip \
+            WezTerm-nightly-setup.exe.sha256 WezTerm-windows-nightly.zip.sha256 \
+            build-info.txt build-info.txt.sha256
+          gh api --method PATCH "repos/$GH_REPO/git/refs/tags/$tag" \
+            -f sha="$PATCH_COMMIT" -F force=true
+          {
+            echo 'Unofficial, unsigned Windows x64 nightly: upstream main with the pinned Windows IME caret patch.'
+            echo
+            echo "Sources: upstream=${UPSTREAM_SHA} patch=${PATCH_COMMIT} workflow=${WORKFLOW_SHA}"
+            echo
+            echo "Upstream: https://github.com/wezterm/wezterm/commit/${UPSTREAM_SHA}"
+            echo "Patch: https://github.com/${GITHUB_REPOSITORY}/commit/${PATCH_COMMIT}"
+            echo "Workflow: https://github.com/${GITHUB_REPOSITORY}/commit/${WORKFLOW_SHA}"
+            echo
+            cat build-info.txt
+          } > release-notes.txt
+          # Publish the source marker last; failed uploads must not suppress the next build.
+          gh release edit "$tag" --title 'WezTerm IME Nightly (Windows x64)' \
+            --notes-file release-notes.txt --draft=false --prerelease --latest=false
+          gh release view "$tag" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"

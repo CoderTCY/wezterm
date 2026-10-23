@@ -12,6 +12,27 @@ User facing docs and guide at: https://wezterm.org/
 
 https://wezterm.org/installation
 
+### Patched Windows IME nightly (this fork)
+
+Unofficial, unsigned Windows x64 packages are available from the
+[IME nightly release](https://github.com/CoderTCY/wezterm/releases/tag/ime-nightly).
+Use the complete portable ZIP or installer; the GUI also needs its bundled
+`OpenConsole.exe`, `conpty.dll`, graphics libraries and other runtime files.
+
+The [fork-only workflow](.github/workflows/wezterm-ime-nightly.yml) checks
+upstream `main` daily at 03:17 UTC and skips already published source/workflow
+combinations. Manual dispatch always rebuilds. It applies the pinned IME patch
+only in the runner, runs the Windows IME regression tests, uses upstream
+packaging, checks the portable runtime, then publishes packages with SHA-256
+checksums and `build-info.txt` identifying upstream, patch and workflow revisions.
+Patch conflicts or failed checks stop publication.
+
+The original development history is preserved on `fix/8229-windows-ime-caret`;
+`patches/windows-ime-caret` holds the standalone, single-commit patch.
+To update the patch, prepare a new standalone commit based on upstream and
+update `PATCH_COMMIT` in the workflow. Keep `main` at upstream plus one
+fork-automation commit; upstream workflow files are not modified.
+
 ## Getting help
 
 This is a spare time project, so please bear with me.  There are a couple of channels for support:
