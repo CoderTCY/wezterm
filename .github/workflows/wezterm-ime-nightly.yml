@@ -134,11 +134,21 @@ jobs:
           cp assets/windows/conhost/conpty.dll assets/windows/conhost/OpenConsole.exe \
              assets/windows/angle/libEGL.dll assets/windows/angle/libGLESv2.dll "$out/"
           cp assets/windows/mesa/opengl32.dll "$CARGO_TARGET_DIR/release/mesa/"
+
       - name: Build release binaries
         shell: cmd
         run: |
           set "PATH=C:\Strawberry\perl\bin;%PATH%"
           cargo build --release --locked -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+
+      # ci/deploy.sh and ci/windows-installer.iss read built binaries from the
+      # hard-coded <repo>/target/release, so mirror them there after the build.
+      - name: Mirror built binaries into the hard-coded target dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -f "$CARGO_TARGET_DIR"/release/{wezterm,wezterm-gui,wezterm-mux-server,strip-ansi-escapes}.exe \
+                "$CARGO_TARGET_DIR"/release/wezterm.pdb target/release/
 
       - name: Test Windows IME offsets and caret geometry
         shell: cmd
@@ -152,7 +162,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash ci/deploy.sh "$CARGO_TARGET_DIR"
+          bash ci/deploy.sh
           test -s WezTerm-nightly-setup.exe
           test -s WezTerm-windows-nightly.zip
           7z t WezTerm-windows-nightly.zip
