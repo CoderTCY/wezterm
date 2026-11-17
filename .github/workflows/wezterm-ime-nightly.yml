@@ -120,6 +120,19 @@ jobs:
           cp .cargo/config.toml .cargo/config
           cargo vendor --locked --versioned-dirs >> .cargo/config
 
+      # wezterm-gui/build.rs copies runtime DLLs into a hard-coded
+      # <repo>/target/<profile> directory and panics (os error 3) when the
+      # target dir is redirected. Pre-seed them into CARGO_TARGET_DIR so the
+      # build script finds them and skips its copies.
+      - name: Pre-seed runtime DLLs for the redirected target dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$CARGO_TARGET_DIR/release"
+          mkdir -p "$out/mesa"
+          cp assets/windows/conhost/conpty.dll assets/windows/conhost/OpenConsole.exe \
+             assets/windows/angle/libEGL.dll assets/windows/angle/libGLESv2.dll "$out/"
+          cp assets/windows/mesa/opengl32.dll "$out/mesa/"
       - name: Build release binaries
         shell: cmd
         run: |
